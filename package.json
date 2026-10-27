@@ -15,7 +15,7 @@
     "preview:server": "npm run preview --workspace=server",
     "dev:server": "npm run dev --workspace=server",
     "dev:extension": "npm run dev --workspace=extension",
-    "package": "VITE_API_BASE_URL=https://dropguard-api.onrender.com npm run build:extension && (cd extension/dist && zip -q -r -FS ../../dropguard-extension-v1.0.0.zip .)",
+    "package": "VITE_API_BASE_URL=https://dropguard-api.dropguard.workers.dev npm run build:extension && (cd extension/dist && zip -q -r -FS ../../dropguard-extension-v1.0.0.zip .)",
     "test": "tsx test_verification.ts"
   },
   "devDependencies": {
