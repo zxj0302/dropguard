@@ -212,7 +212,7 @@ export function isDevOrAdminAuthorized(c: any): boolean {
  * APP_BASE_URL is required outside development mode.
  */
 function getAppBaseUrl(): string | null {
-  const configured = process.env.APP_BASE_URL;
+  const configured = process.env.APP_BASE_URL || process.env.RENDER_EXTERNAL_URL;
   if (configured) {
     try {
       return new URL(configured).origin;
