@@ -1,0 +1,16 @@
+name = "dropguard-api"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+NODE_ENV = "production"
+
+# KV namespace for Pro devices and rate limiting
+# You can generate production & preview IDs using:
+# npx wrangler kv:namespace create DROP_GUARD_KV
+# npx wrangler kv:namespace create DROP_GUARD_KV --preview
+[[kv_namespaces]]
+binding = "DROP_GUARD_KV"
+id = "dropguard_kv_prod_placeholder"
+preview_id = "dropguard_kv_preview_placeholder"

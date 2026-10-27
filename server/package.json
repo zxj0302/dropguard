@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "dev": "NODE_ENV=development tsx watch src/index.ts",
+    "preview": "wrangler dev",
+    "deploy": "wrangler deploy",
     "build": "tsc",
     "start": "node dist/index.js"
   },
@@ -16,6 +18,8 @@
     "typescript": "^5.6.3"
   },
   "devDependencies": {
-    "tsx": "^4.19.2"
+    "@cloudflare/workers-types": "^5.20261027.1",
+    "tsx": "^4.19.2",
+    "wrangler": "^4.153.0"
   }
 }

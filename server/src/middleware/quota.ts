@@ -206,6 +206,71 @@ export interface ActivateOptions {
   paymentIntent?: string;
 }
 
+export async function activateProDeviceAsync(
+  deviceId: string,
+  options: ActivateOptions = {},
+  kv?: any
+): Promise<boolean> {
+  const safeId = sanitizeAndValidateDeviceId(deviceId);
+  if (!safeId) return false;
+
+  const now = Date.now();
+  let existing = proDevices.get(safeId);
+
+  // If KV is bound and not in memory, try to load from KV first
+  if (!existing && kv && typeof kv.get === 'function') {
+    try {
+      existing = await kv.get(`pro:${safeId}`, 'json');
+    } catch {
+      // ignore
+    }
+  }
+
+  // Idempotency: the same checkout session must only extend entitlement once
+  if (options.sessionId && existing?.sessions?.includes(options.sessionId)) return true;
+
+  const next: ProRecord = { ...(existing || {}) };
+  next.activatedAt = now;
+  if (options.plan) {
+    const duration = options.plan === 'annual' ? ANNUAL_VALIDITY_MS : MONTHLY_VALIDITY_MS;
+    const wasPermanent = existing !== undefined && (existing.expiresAt === null || existing.expiresAt === undefined);
+    if (wasPermanent) {
+      next.expiresAt = null; // never downgrade a non-expiring entitlement
+    } else {
+      const base = Math.max(now, existing?.expiresAt ?? now);
+      next.expiresAt = base + duration;
+    }
+    next.plan = options.plan;
+  } else {
+    next.expiresAt = null; // admin/dev activation: non-expiring
+  }
+  if (options.paymentIntent) next.paymentIntent = options.paymentIntent;
+  if (options.sessionId) next.sessions = [...(existing?.sessions || []), options.sessionId].slice(-20);
+
+  proDevices.set(safeId, next);
+
+  // Write to KV if present
+  if (kv && typeof kv.put === 'function') {
+    try {
+      await kv.put(`pro:${safeId}`, JSON.stringify(next));
+      if (next.paymentIntent) {
+        await kv.put(`pi:${next.paymentIntent}`, safeId);
+      }
+    } catch (err) {
+      console.error(`[DropGuard Quota] ❌ Failed to write Pro device to KV: ${(err as Error)?.message}`);
+    }
+  }
+
+  // Also persist to disk if filesystem is available
+  try {
+    savePersistedProDevices(proDevices);
+  } catch {
+    // ignore in serverless environment
+  }
+
+  return true;
+}
+
 export function activateProDevice(deviceId: string, options: ActivateOptions = {}): boolean {
   const safeId = sanitizeAndValidateDeviceId(deviceId);
   if (!safeId) return false;
@@ -235,10 +300,46 @@ export function activateProDevice(deviceId: string, options: ActivateOptions = {
   if (options.sessionId) next.sessions = [...(existing?.sessions || []), options.sessionId].slice(-20);
 
   proDevices.set(safeId, next);
-  if (!savePersistedProDevices(proDevices)) {
-    console.error(`[DropGuard Quota] ⚠️ Pro for ${safeId} is active in memory only (persist failed).`);
+  try {
+    if (!savePersistedProDevices(proDevices)) {
+      console.error(`[DropGuard Quota] ⚠️ Pro for ${safeId} is active in memory only (persist failed).`);
+    }
+  } catch {
+    // ignore in read-only environment
   }
   return true;
+}
+
+export async function isProDeviceAsync(deviceId: string, kv?: any): Promise<boolean> {
+  const safeId = sanitizeAndValidateDeviceId(deviceId);
+  if (!safeId) return false;
+
+  // 1. Check in-memory fast cache first
+  const cached = proDevices.get(safeId);
+  if (cached) {
+    if (typeof cached.expiresAt === 'number' && cached.expiresAt <= Date.now()) {
+      return false;
+    }
+    return true;
+  }
+
+  // 2. Check KV if bound
+  if (kv && typeof kv.get === 'function') {
+    try {
+      const rec = await kv.get(`pro:${safeId}`, 'json');
+      if (rec && typeof rec === 'object') {
+        if (typeof rec.expiresAt === 'number' && rec.expiresAt <= Date.now()) {
+          return false;
+        }
+        proDevices.set(safeId, rec);
+        return true;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return false;
 }
 
 export function isProDevice(deviceId: string): boolean {
@@ -251,15 +352,55 @@ export function isProDevice(deviceId: string): boolean {
 }
 
 /** Revokes Pro for a device (admin reset or refund). Returns true if a record was removed. */
+export async function revokeProDeviceAsync(deviceId: string, kv?: any): Promise<boolean> {
+  const safeId = sanitizeAndValidateDeviceId(deviceId);
+  if (!safeId) return false;
+  const had = proDevices.has(safeId);
+  proDevices.delete(safeId);
+  if (kv && typeof kv.delete === 'function') {
+    try {
+      await kv.delete(`pro:${safeId}`);
+    } catch {
+      // ignore
+    }
+  }
+  try {
+    savePersistedProDevices(proDevices);
+  } catch {
+    // ignore
+  }
+  return had || Boolean(kv);
+}
+
 export function revokeProDevice(deviceId: string): boolean {
   const safeId = sanitizeAndValidateDeviceId(deviceId);
   if (!safeId || !proDevices.has(safeId)) return false;
   proDevices.delete(safeId);
-  savePersistedProDevices(proDevices);
+  try {
+    savePersistedProDevices(proDevices);
+  } catch {
+    // ignore
+  }
   return true;
 }
 
 /** Finds the device bound to a Stripe PaymentIntent (used for refund handling). */
+export async function findDeviceByPaymentIntentAsync(paymentIntent: string, kv?: any): Promise<string | null> {
+  if (!paymentIntent) return null;
+  for (const [id, rec] of proDevices.entries()) {
+    if (rec.paymentIntent === paymentIntent) return id;
+  }
+  if (kv && typeof kv.get === 'function') {
+    try {
+      const foundId = await kv.get(`pi:${paymentIntent}`);
+      if (foundId) return foundId;
+    } catch {
+      // ignore
+    }
+  }
+  return null;
+}
+
 export function findDeviceByPaymentIntent(paymentIntent: string): string | null {
   if (!paymentIntent) return null;
   for (const [id, rec] of proDevices.entries()) {
@@ -275,7 +416,12 @@ const DEFAULT_UPGRADE_HOST = 'localhost:8787';
  */
 export function generateSafeUpgradeUrl(c: Context, deviceId: string): string {
   // 1. Explicit environment configuration takes highest precedence
-  const configuredBaseUrl = process.env.APP_BASE_URL || process.env.PUBLIC_URL || process.env.UPGRADE_BASE_URL;
+  const configuredBaseUrl =
+    (c?.env as any)?.APP_BASE_URL ||
+    (c?.env as any)?.PUBLIC_URL ||
+    (c?.env as any)?.UPGRADE_BASE_URL ||
+    (typeof process !== 'undefined' ? (process.env?.APP_BASE_URL || process.env?.PUBLIC_URL || process.env?.UPGRADE_BASE_URL) : '');
+
   if (configuredBaseUrl) {
     try {
       const parsed = new URL(configuredBaseUrl);
@@ -286,12 +432,16 @@ export function generateSafeUpgradeUrl(c: Context, deviceId: string): string {
   }
 
   // 2. Strict Host Whitelist validation
+  const envHosts =
+    (typeof process !== 'undefined' && process.env?.ALLOWED_HOSTS ? process.env.ALLOWED_HOSTS.split(',') : []) ||
+    ((c?.env as any)?.ALLOWED_HOSTS ? String((c.env as any).ALLOWED_HOSTS).split(',') : []);
+
   const allowedHosts = new Set<string>([
     'localhost:8787',
     '127.0.0.1:8787',
     'localhost',
     '127.0.0.1',
-    ...(process.env.ALLOWED_HOSTS ? process.env.ALLOWED_HOSTS.split(',').map((h) => h.trim().toLowerCase()) : []),
+    ...envHosts.map((h: string) => h.trim().toLowerCase()),
   ]);
 
   // When behind multiple reverse proxies or CDNs (e.g. Cloudflare + Nginx), X-Forwarded-Host may contain a comma-separated list.
@@ -333,7 +483,10 @@ function getNextResetIsoString(): string {
 let lastPruneTimestamp = 0;
 
 // Per-IP daily free-scan counters: stops free quota farming by rotating X-Device-Id values.
-const IP_DAILY_FREE_LIMIT = Number(process.env.IP_DAILY_FREE_LIMIT) > 0 ? Number(process.env.IP_DAILY_FREE_LIMIT) : 30;
+const IP_DAILY_FREE_LIMIT =
+  typeof process !== 'undefined' && Number(process.env?.IP_DAILY_FREE_LIMIT) > 0
+    ? Number(process.env.IP_DAILY_FREE_LIMIT)
+    : 30;
 const MAX_IP_ENTRIES = 20000;
 const ipQuotas = new Map<string, QuotaRecord>();
 
@@ -359,11 +512,18 @@ function pruneExpiredQuotas() {
 }
 
 /**
- * Resolves the client IP. X-Forwarded-For is only trusted when TRUST_PROXY=true
- * (i.e. the server sits behind a reverse proxy that overwrites the header).
+ * Resolves the client IP.
+ * Prioritizes Cloudflare Connecting IP, then trusted reverse proxy headers.
  */
 function getClientIp(c: Context): string {
-  if (process.env.TRUST_PROXY === 'true') {
+  const cfIp = c.req.header('cf-connecting-ip');
+  if (cfIp) return cfIp.trim();
+
+  const trustProxy =
+    (typeof process !== 'undefined' && process.env?.TRUST_PROXY === 'true') ||
+    (c.env as any)?.TRUST_PROXY === 'true';
+
+  if (trustProxy) {
     const xff = c.req.header('x-forwarded-for');
     if (xff) {
       const first = xff.split(',')[0].trim();
@@ -384,6 +544,8 @@ function getClientIp(c: Context): string {
  * Returns HTTP 402 with QUOTA_EXCEEDED when exceeded.
  */
 export async function quotaMiddleware(c: Context, next: Next) {
+  const kv = (c.env as any)?.DROP_GUARD_KV;
+
   // Periodically prune stale device records if memory map grows
   if (deviceQuotas.size > 500) {
     pruneExpiredQuotas();
@@ -411,8 +573,9 @@ export async function quotaMiddleware(c: Context, next: Next) {
     );
   }
 
-  // Bypass quota checks for Pro subscribers
-  if (isProDevice(deviceId)) {
+  // Bypass quota checks for Pro subscribers (checks in-memory and KV)
+  const isPro = await isProDeviceAsync(deviceId, kv);
+  if (isPro) {
     c.header('X-Quota-Limit', '999999');
     c.header('X-Quota-Remaining', '999999');
     c.header('X-Quota-Reset', getNextResetIsoString());
@@ -422,17 +585,30 @@ export async function quotaMiddleware(c: Context, next: Next) {
   }
 
   const today = getTodayDateString();
-  const currentRecord = deviceQuotas.get(deviceId);
+  let currentRecord = deviceQuotas.get(deviceId);
+
+  if ((!currentRecord || currentRecord.date !== today) && kv && typeof kv.get === 'function') {
+    try {
+      const kvVal = await kv.get(`quota:${today}:${deviceId}`);
+      if (kvVal !== null) {
+        currentRecord = { date: today, count: parseInt(kvVal, 10) || 0 };
+        deviceQuotas.set(deviceId, currentRecord);
+      }
+    } catch {
+      // ignore
+    }
+  }
 
   if (!currentRecord || currentRecord.date !== today) {
     // New day or new device -> reset quota to 0 (never evicts today's consumed records)
     if (!currentRecord && !enforceMemoryMapCap()) {
       return c.json({ error: 'SERVICE_BUSY', message: 'Quota tracking capacity reached. Please try again later.' }, 503);
     }
-    deviceQuotas.set(deviceId, { date: today, count: 0 });
+    currentRecord = { date: today, count: 0 };
+    deviceQuotas.set(deviceId, currentRecord);
   }
 
-  const record = deviceQuotas.get(deviceId)!;
+  const record = currentRecord;
 
   // Per-IP dimension: cap total free scans from one address regardless of device id rotation
   const clientIp = getClientIp(c);
@@ -483,6 +659,13 @@ export async function quotaMiddleware(c: Context, next: Next) {
   record.count += 1;
   ipRecord.count += 1;
   const countedIpRecord = ipRecord;
+  if (kv && typeof kv.put === 'function') {
+    try {
+      await kv.put(`quota:${today}:${deviceId}`, String(record.count), { expirationTtl: 86400 * 2 });
+    } catch {
+      // ignore
+    }
+  }
 
   try {
     await next();
@@ -492,6 +675,13 @@ export async function quotaMiddleware(c: Context, next: Next) {
     if (!c.res || c.res.status < 200 || c.res.status >= 400) {
       record.count = Math.max(0, record.count - 1);
       countedIpRecord.count = Math.max(0, countedIpRecord.count - 1);
+      if (kv && typeof kv.put === 'function') {
+        try {
+          await kv.put(`quota:${today}:${deviceId}`, String(record.count), { expirationTtl: 86400 * 2 });
+        } catch {
+          // ignore
+        }
+      }
     }
 
     const remaining = Math.max(0, DAILY_FREE_LIMIT - record.count);
@@ -506,6 +696,56 @@ export async function quotaMiddleware(c: Context, next: Next) {
 /**
  * Helper to inspect or reset quota (useful for testing)
  */
+export async function getDeviceQuotaStatusAsync(deviceId: string, kv?: any) {
+  const safeId = sanitizeAndValidateDeviceId(deviceId);
+  if (!safeId) {
+    return {
+      date: getTodayDateString(),
+      used: 0,
+      remaining: 0,
+      limit: DAILY_FREE_LIMIT,
+      is_pro: false,
+      error: 'INVALID_DEVICE_ID',
+    };
+  }
+
+  const isPro = await isProDeviceAsync(safeId, kv);
+  if (isPro) {
+    return {
+      date: getTodayDateString(),
+      used: 0,
+      remaining: 999999,
+      limit: 999999,
+      is_pro: true,
+    };
+  }
+
+  const today = getTodayDateString();
+  let record = deviceQuotas.get(safeId);
+  if ((!record || record.date !== today) && kv && typeof kv.get === 'function') {
+    try {
+      const kvVal = await kv.get(`quota:${today}:${safeId}`);
+      if (kvVal !== null) {
+        record = { date: today, count: parseInt(kvVal, 10) || 0 };
+        deviceQuotas.set(safeId, record);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (!record || record.date !== today) {
+    return { date: today, used: 0, remaining: DAILY_FREE_LIMIT, limit: DAILY_FREE_LIMIT, is_pro: false };
+  }
+  return {
+    date: today,
+    used: record.count,
+    remaining: Math.max(0, DAILY_FREE_LIMIT - record.count),
+    limit: DAILY_FREE_LIMIT,
+    is_pro: false,
+  };
+}
+
 export function getDeviceQuotaStatus(deviceId: string) {
   const safeId = sanitizeAndValidateDeviceId(deviceId);
   if (!safeId) {

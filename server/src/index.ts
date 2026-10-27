@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Hono } from 'hono';
+import { Hono, Context } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { serve } from '@hono/node-server';
@@ -10,17 +10,36 @@ import { bodyLimit } from 'hono/body-limit';
 import {
   quotaMiddleware,
   getDeviceQuotaStatus,
+  getDeviceQuotaStatusAsync,
   resetDeviceQuota,
   activateProDevice,
+  activateProDeviceAsync,
   isProDevice,
+  isProDeviceAsync,
   revokeProDevice,
+  revokeProDeviceAsync,
   findDeviceByPaymentIntent,
+  findDeviceByPaymentIntentAsync,
   sanitizeAndValidateDeviceId,
 } from './middleware/quota.js';
 import { analyzeProductTitleForIP } from './services/ipRadar.js';
 import { analyzeSourcing, SourceFinderRequest } from './services/sourceFinder.js';
 
-const app = new Hono();
+export type CloudflareBindings = {
+  DROP_GUARD_KV?: any;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
+  CHECKOUT_SECRET?: string;
+  ADMIN_KEY?: string;
+  ADMIN_SECRET?: string;
+  NODE_ENV?: string;
+  TRUST_PROXY?: string;
+  APP_BASE_URL?: string;
+  PUBLIC_URL?: string;
+  UPGRADE_BASE_URL?: string;
+};
+
+const app = new Hono<{ Bindings: CloudflareBindings }>();
 
 // Load .env file automatically if present
 try {
@@ -112,19 +131,78 @@ const usedCheckoutTokens = loadPersistedUsedTokens();
  * Explicit development mode: only NODE_ENV=development enables simulation and open admin endpoints.
  * Anything else (unset, production, test, ...) is treated as locked-down.
  */
-export function isDevMode(): boolean {
-  return process.env.NODE_ENV === 'development';
+export function isDevMode(c?: Context): boolean {
+  if (c?.env?.NODE_ENV) return c.env.NODE_ENV === 'development';
+  return typeof process !== 'undefined' && process.env?.NODE_ENV === 'development';
 }
 
 /**
  * Generates a tamper-proof HMAC-signed checkout token for simulated payments (development mode only).
  */
-export function generateCheckoutToken(deviceId: string): string {
+export function generateCheckoutToken(deviceId: string, secretOverride?: string): string {
+  const secret = secretOverride || CHECKOUT_SECRET;
   const timestamp = Date.now();
   const nonce = crypto.randomBytes(16).toString('hex');
   const payload = `${deviceId}:${timestamp}:${nonce}`;
-  const hmac = crypto.createHmac('sha256', CHECKOUT_SECRET).update(payload).digest('hex');
+  const hmac = crypto.createHmac('sha256', secret).update(payload).digest('hex');
   return Buffer.from(`${payload}:${hmac}`).toString('base64url');
+}
+
+/**
+ * Validates a checkout token asynchronously, checking both in-memory cache and Cloudflare KV.
+ */
+export async function verifyAndConsumeCheckoutTokenAsync(deviceId: string, token: string, kv?: any, secretOverride?: string): Promise<boolean> {
+  try {
+    if (!token || typeof token !== 'string') return false;
+    if (usedCheckoutTokens.has(token)) return false;
+
+    if (kv && typeof kv.get === 'function') {
+      const isUsed = await kv.get(`token:${token}`);
+      if (isUsed) return false;
+    }
+
+    const decoded = Buffer.from(token, 'base64url').toString('utf-8');
+    const parts = decoded.split(':');
+    if (parts.length !== 4) return false;
+    const [tokenDeviceId, timestampStr, nonce, hmac] = parts;
+    const timestamp = Number(timestampStr);
+
+    if (tokenDeviceId !== deviceId) return false;
+    // Allow tokens valid within 24 hours
+    if (!Number.isFinite(timestamp) || Date.now() - timestamp > CHECKOUT_TOKEN_TTL_MS || Date.now() < timestamp - 60000) {
+      return false;
+    }
+
+    const secret = secretOverride || CHECKOUT_SECRET;
+    const payload = `${tokenDeviceId}:${timestampStr}:${nonce}`;
+    const expectedHmac = crypto.createHmac('sha256', secret).update(payload).digest('hex');
+    const given = Buffer.from(hmac, 'hex');
+    const expected = Buffer.from(expectedHmac, 'hex');
+    if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return false;
+
+    // Prune only expired entries; fail closed if the replay set is still full
+    if (usedCheckoutTokens.size >= MAX_USED_TOKENS) {
+      const now = Date.now();
+      for (const [t, exp] of usedCheckoutTokens) {
+        if (exp <= now) usedCheckoutTokens.delete(t);
+      }
+      if (usedCheckoutTokens.size >= MAX_USED_TOKENS) return false;
+    }
+    usedCheckoutTokens.set(token, timestamp + CHECKOUT_TOKEN_TTL_MS);
+
+    if (kv && typeof kv.put === 'function') {
+      try {
+        await kv.put(`token:${token}`, '1', { expirationTtl: Math.ceil(CHECKOUT_TOKEN_TTL_MS / 1000) });
+      } catch {
+        // ignore
+      }
+    }
+
+    persistUsedTokens(usedCheckoutTokens);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -195,9 +273,12 @@ function safeEqual(a: string, b: string): boolean {
  * Without an ADMIN_KEY, administrative endpoints always return 403 outside development.
  */
 export function isDevOrAdminAuthorized(c: any): boolean {
-  if (isDevMode()) return true;
+  if (isDevMode(c)) return true;
 
-  const adminKey = process.env.ADMIN_KEY || process.env.ADMIN_SECRET;
+  const adminKey =
+    c?.env?.ADMIN_KEY ||
+    c?.env?.ADMIN_SECRET ||
+    (typeof process !== 'undefined' ? (process.env?.ADMIN_KEY || process.env?.ADMIN_SECRET) : '');
   if (!adminKey) return false;
 
   const reqAdminKey = c.req.header('x-admin-key') || '';
@@ -211,8 +292,11 @@ export function isDevOrAdminAuthorized(c: any): boolean {
  * Resolves the public base URL used for Stripe redirect URLs. Never derived from request headers.
  * APP_BASE_URL is required outside development mode.
  */
-function getAppBaseUrl(): string | null {
-  const configured = process.env.APP_BASE_URL || process.env.RENDER_EXTERNAL_URL;
+function getAppBaseUrl(c?: any): string | null {
+  const configured =
+    c?.env?.APP_BASE_URL ||
+    c?.env?.PUBLIC_URL ||
+    (typeof process !== 'undefined' ? (process.env?.APP_BASE_URL || process.env?.RENDER_EXTERNAL_URL) : '');
   if (configured) {
     try {
       return new URL(configured).origin;
@@ -220,7 +304,7 @@ function getAppBaseUrl(): string | null {
       return null;
     }
   }
-  if (isDevMode()) return `http://localhost:${Number(process.env.PORT) || 8787}`;
+  if (isDevMode(c)) return `http://localhost:${(typeof process !== 'undefined' && Number(process.env?.PORT)) || 8787}`;
   return null;
 }
 
@@ -259,17 +343,21 @@ export function verifyStripeSignature(rawBody: string, sigHeader: string, secret
  * (webhook signature or server-side session retrieval). Requires payment_status === 'paid'.
  * Returns the activated device id, or null.
  */
-function activateFromPaidSession(session: any): string | null {
+async function activateFromPaidSession(session: any, kv?: any): Promise<string | null> {
   if (!session || session.payment_status !== 'paid') return null;
   const dev = sanitizeAndValidateDeviceId(session.client_reference_id || session.metadata?.device_id || '');
   if (!dev) return null;
   const plan = session.metadata?.plan === 'annual' ? 'annual' : 'monthly';
   const paymentIntent = typeof session.payment_intent === 'string' ? session.payment_intent : undefined;
-  const ok = activateProDevice(dev, {
-    plan,
-    sessionId: typeof session.id === 'string' ? session.id : undefined,
-    paymentIntent,
-  });
+  const ok = await activateProDeviceAsync(
+    dev,
+    {
+      plan,
+      sessionId: typeof session.id === 'string' ? session.id : undefined,
+      paymentIntent,
+    },
+    kv
+  );
   return ok ? dev : null;
 }
 
@@ -296,13 +384,15 @@ app.use(
 
 // 1. Health Check
 app.get('/health', (c) => {
+  const stripeKey = (c.env as any)?.STRIPE_SECRET_KEY || (typeof process !== 'undefined' ? process.env?.STRIPE_SECRET_KEY : '') || '';
   return c.json({
     status: 'ok',
     service: 'DropGuard Radar Server',
     version: '1.0.0',
-    stripe_configured: Boolean(STRIPE_SECRET_KEY),
+    platform: (c.env as any)?.DROP_GUARD_KV ? 'cloudflare-workers' : 'node',
+    stripe_configured: Boolean(stripeKey),
     timestamp: new Date().toISOString(),
-    uptime_seconds: Math.floor(process.uptime()),
+    uptime_seconds: typeof process !== 'undefined' && typeof process.uptime === 'function' ? Math.floor(process.uptime()) : 0,
   });
 });
 
@@ -315,24 +405,25 @@ app.get('/pricing', async (c) => {
   const initialLang = (c.req.query('lang') || 'en').toLowerCase().startsWith('zh') ? 'zh' : 'en';
   const safeDeviceId = escapeHtml(deviceId);
   // Simulated checkout (and its token) exists ONLY in explicit development mode
-  const simulationEnabled = isDevMode();
+  const simulationEnabled = isDevMode(c);
   const checkoutToken = simulationEnabled && deviceId ? generateCheckoutToken(deviceId) : '';
-  const hasStripe = Boolean(STRIPE_SECRET_KEY);
+  const stripeKey = (c.env as any)?.STRIPE_SECRET_KEY || (typeof process !== 'undefined' ? process.env?.STRIPE_SECRET_KEY : '') || '';
+  const hasStripe = Boolean(stripeKey);
   const isSuccessRedirect = c.req.query('success') === 'true';
   const sessionId = c.req.query('session_id') || '';
 
   // If returning from real Stripe Checkout with session_id, verify payment server-side and activate.
   // This (and the signed webhook) is the only production activation path.
-  if (isSuccessRedirect && sessionId && STRIPE_SECRET_KEY) {
+  if (isSuccessRedirect && sessionId && stripeKey) {
     try {
       const sRes = await fetch(`https://api.stripe.com/v1/checkout/sessions/${encodeURIComponent(sessionId)}`, {
-        headers: { Authorization: `Bearer ${STRIPE_SECRET_KEY}` },
+        headers: { Authorization: `Bearer ${stripeKey}` },
         signal: AbortSignal.timeout(STRIPE_TIMEOUT_MS),
       });
       if (sRes.ok) {
         const sData = await sRes.json();
         if (sData.payment_status === 'paid') {
-          const dev = activateFromPaidSession(sData);
+          const dev = await activateFromPaidSession(sData, (c.env as any)?.DROP_GUARD_KV);
           if (dev) {
             console.log(`[DropGuard Stripe Redirect] 🎉 Verified paid session ${sessionId}! Activated PRO for device: ${dev}`);
           }
@@ -343,7 +434,7 @@ app.get('/pricing', async (c) => {
     }
   }
 
-  const isCurrentlyPro = Boolean(deviceId && isProDevice(deviceId));
+  const isCurrentlyPro = Boolean(deviceId && (await isProDeviceAsync(deviceId, (c.env as any)?.DROP_GUARD_KV)));
 
   const html = `<!DOCTYPE html>
 <html lang="${initialLang}" class="dark">
@@ -973,8 +1064,9 @@ app.post('/api/v1/checkout-token', async (c) => {
 // 2.2 Official Stripe Checkout Session Creator
 app.post('/api/v1/create-stripe-checkout', async (c) => {
   try {
-    if (!STRIPE_SECRET_KEY) {
-      if (isDevMode()) {
+    const stripeKey = (c.env as any)?.STRIPE_SECRET_KEY || (typeof process !== 'undefined' ? process.env?.STRIPE_SECRET_KEY : '') || '';
+    if (!stripeKey) {
+      if (isDevMode(c)) {
         return c.json({ simulated: true, message: 'Stripe secret key not configured. Using local checkout simulation.' });
       }
       return c.json({ error: 'PAYMENTS_UNAVAILABLE', message: 'Payments are not configured.' }, 503);
@@ -988,7 +1080,7 @@ app.post('/api/v1/create-stripe-checkout', async (c) => {
 
     const plan = body?.plan === 'annual' ? 'annual' : 'monthly';
     // Redirect base comes from configuration only; request headers are never trusted
-    const origin = getAppBaseUrl();
+    const origin = getAppBaseUrl(c);
     if (!origin) {
       console.error('[DropGuard Server] APP_BASE_URL is not configured; refusing to create Stripe session.');
       return c.json({ error: 'SERVER_MISCONFIGURED', message: 'Payments are not configured.' }, 503);
@@ -1012,7 +1104,7 @@ app.post('/api/v1/create-stripe-checkout', async (c) => {
     const stripeRes = await fetch('https://api.stripe.com/v1/checkout/sessions', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${STRIPE_SECRET_KEY}`,
+        'Authorization': `Bearer ${stripeKey}`,
         'Content-Type': 'application/x-www-form-urlencoded',
       },
       body: params.toString(),
@@ -1034,7 +1126,8 @@ app.post('/api/v1/create-stripe-checkout', async (c) => {
 // 2.3 Official Stripe Webhook Endpoint (signature verification is mandatory)
 app.post('/api/v1/stripe-webhook', async (c) => {
   try {
-    if (!STRIPE_WEBHOOK_SECRET) {
+    const webhookSecret = (c.env as any)?.STRIPE_WEBHOOK_SECRET || (typeof process !== 'undefined' ? process.env?.STRIPE_WEBHOOK_SECRET : '') || '';
+    if (!webhookSecret) {
       console.error('[DropGuard Stripe Webhook] Rejected: STRIPE_WEBHOOK_SECRET is not configured.');
       return c.json({ error: 'WEBHOOK_NOT_CONFIGURED', message: 'STRIPE_WEBHOOK_SECRET is not configured' }, 500);
     }
@@ -1044,7 +1137,7 @@ app.post('/api/v1/stripe-webhook', async (c) => {
     if (!sigHeader) {
       return c.json({ error: 'MISSING_SIGNATURE' }, 400);
     }
-    if (!verifyStripeSignature(rawBody, sigHeader, STRIPE_WEBHOOK_SECRET)) {
+    if (!verifyStripeSignature(rawBody, sigHeader, webhookSecret)) {
       return c.json({ error: 'SIGNATURE_VERIFICATION_FAILED' }, 401);
     }
 
@@ -1053,7 +1146,7 @@ app.post('/api/v1/stripe-webhook', async (c) => {
 
     if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') {
       // Delayed payment methods complete as 'unpaid' first; only a 'paid' session activates Pro
-      const dev = activateFromPaidSession(obj);
+      const dev = await activateFromPaidSession(obj, (c.env as any)?.DROP_GUARD_KV);
       if (dev) {
         console.log(`[DropGuard Stripe Webhook] 🎉 Payment verified! Activated PRO for device: ${dev}`);
       }
@@ -1063,9 +1156,9 @@ app.post('/api/v1/stripe-webhook', async (c) => {
       if (fullyRefunded) {
         const paymentIntent = typeof obj?.payment_intent === 'string' ? obj.payment_intent : '';
         const dev =
-          findDeviceByPaymentIntent(paymentIntent) ||
+          (await findDeviceByPaymentIntentAsync(paymentIntent, (c.env as any)?.DROP_GUARD_KV)) ||
           sanitizeAndValidateDeviceId(obj?.metadata?.device_id || '');
-        if (dev && revokeProDevice(dev)) {
+        if (dev && (await revokeProDeviceAsync(dev, (c.env as any)?.DROP_GUARD_KV))) {
           console.log(`[DropGuard Stripe Webhook] Revoked PRO for device ${dev} (${event.type})`);
         }
       }
@@ -1093,7 +1186,7 @@ app.post('/api/v1/activate-pro', async (c) => {
     const isAdmin = isDevOrAdminAuthorized(c);
     // Checkout tokens (simulated payments) are honoured ONLY in explicit development mode
     const checkoutToken = body?.checkout_token || c.req.header('x-checkout-token') || '';
-    const isCheckoutValid = isDevMode() && checkoutToken ? verifyAndConsumeCheckoutToken(deviceId, checkoutToken) : false;
+    const isCheckoutValid = isDevMode(c) && checkoutToken ? await verifyAndConsumeCheckoutTokenAsync(deviceId, checkoutToken, (c.env as any)?.DROP_GUARD_KV) : false;
 
     if (!isAdmin && !isCheckoutValid) {
       return c.json(
@@ -1105,7 +1198,7 @@ app.post('/api/v1/activate-pro', async (c) => {
       );
     }
 
-    activateProDevice(deviceId);
+    await activateProDeviceAsync(deviceId, {}, (c.env as any)?.DROP_GUARD_KV);
     console.log(`[DropGuard Server] 🎉 Device ${deviceId} upgraded to PRO tier!`);
     return c.json({
       status: 'ok',
@@ -1119,7 +1212,7 @@ app.post('/api/v1/activate-pro', async (c) => {
 });
 
 // 4. Check Device Quota Status (does not deduct quota)
-app.get('/api/v1/quota-status', (c) => {
+app.get('/api/v1/quota-status', async (c) => {
   const rawDeviceId = c.req.header('x-device-id') || c.req.header('X-Device-Id');
   if (!rawDeviceId || (typeof rawDeviceId === 'string' && !rawDeviceId.trim())) {
     return c.json({ error: 'MISSING_DEVICE_ID', message: 'Header X-Device-Id required' }, 400);
@@ -1128,7 +1221,7 @@ app.get('/api/v1/quota-status', (c) => {
   if (!deviceId) {
     return c.json({ error: 'INVALID_DEVICE_ID', message: 'Invalid X-Device-Id header. Must be 8-128 characters containing only alphanumeric characters, hyphens, underscores, or dots.' }, 400);
   }
-  const status = getDeviceQuotaStatus(deviceId);
+  const status = await getDeviceQuotaStatusAsync(deviceId, (c.env as any)?.DROP_GUARD_KV);
   return c.json(status);
 });
 
@@ -1155,6 +1248,9 @@ app.post('/api/v1/reset-quota', async (c) => {
       return c.json({ error: 'INVALID_DEVICE_ID', message: 'Invalid device ID format. Must be 8-128 characters containing only alphanumeric characters, hyphens, underscores, or dots.' }, 400);
     }
     resetDeviceQuota(deviceId, body?.revoke_pro === true);
+    if (body?.revoke_pro === true && (c.env as any)?.DROP_GUARD_KV) {
+      await revokeProDeviceAsync(deviceId, (c.env as any)?.DROP_GUARD_KV);
+    }
     return c.json({ status: 'ok', message: `Quota reset for device ${deviceId}` });
   } catch {
     return c.json({ error: 'SERVER_ERROR', message: 'Failed to reset quota' }, 500);
