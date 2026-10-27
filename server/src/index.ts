@@ -416,6 +416,70 @@ app.get('/health', (c) => {
   });
 });
 
+// 1.1 Privacy Policy Page (Mandatory for Chrome Web Store Developer Console)
+app.get('/privacy', (c) => {
+  const html = `<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Privacy Policy - DropGuard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen py-12 px-4 sm:px-6 lg:px-8 font-sans antialiased">
+  <div class="max-w-3xl mx-auto bg-slate-900 border border-slate-800 rounded-2xl p-8 sm:p-12 shadow-2xl">
+    <div class="flex items-center gap-4 mb-8 pb-6 border-b border-slate-800">
+      <span class="text-3xl">🛡️</span>
+      <div>
+        <h1 class="text-2xl font-bold text-white tracking-tight">DropGuard Privacy Policy</h1>
+        <p class="text-xs text-slate-400 mt-1">Effective Date: October 28, 2026 | Last Updated: October 28, 2026</p>
+      </div>
+    </div>
+
+    <div class="space-y-6 text-sm text-slate-300 leading-relaxed">
+      <section>
+        <h2 class="text-base font-semibold text-cyan-400 mb-2">1. Overview & Commitment</h2>
+        <p>DropGuard ("we", "our", or "the Extension") is dedicated to safeguarding user privacy. We adhere strictly to Google Chrome Web Store's Single Purpose Policy and Limited Use Policy. We do not harvest, monetize, or sell personal data.</p>
+      </section>
+
+      <section>
+        <h2 class="text-base font-semibold text-cyan-400 mb-2">2. Information We Process</h2>
+        <ul class="list-disc list-inside space-y-1.5 ml-1 text-slate-300">
+          <li><strong class="text-white">Anonymous Device Identifier:</strong> A randomly generated UUID stored in your browser's local storage (via <code class="bg-slate-800 px-1.5 py-0.5 rounded text-xs text-cyan-300">crypto.randomUUID()</code>) to enforce daily free scanning quotas. It is never linked to your identity, IP, or personal information.</li>
+          <li><strong class="text-white">Product Title & Sourcing Parameters:</strong> When you explicitly click "Scan" or "Analyze Margins", the title of the displayed item is sent to our radar API solely to perform trademark infringement and factory cost calculations. We do not retain or correlate search queries with individuals.</li>
+          <li><strong class="text-white">Payment Information:</strong> All financial transactions are directly processed by Stripe, Inc. We never handle, store, or receive complete credit card numbers or banking credentials.</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2 class="text-base font-semibold text-cyan-400 mb-2">3. Permissions & Justification</h2>
+        <ul class="list-disc list-inside space-y-1.5 ml-1 text-slate-300">
+          <li><code class="bg-slate-800 px-1.5 py-0.5 rounded text-xs text-cyan-300">storage</code>: Retains your anonymous quota identifier and UI theme preferences locally.</li>
+          <li><code class="bg-slate-800 px-1.5 py-0.5 rounded text-xs text-cyan-300">activeTab</code>: Reads product title and pricing on the active e-commerce page only when initiated by the user.</li>
+          <li><code class="bg-slate-800 px-1.5 py-0.5 rounded text-xs text-cyan-300">&lt;all_urls&gt;</code>: Independent Shopify stores operate across hundreds of thousands of custom top-level domains. On non-Shopify domains, the extension remains completely idle and dormant.</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2 class="text-base font-semibold text-cyan-400 mb-2">4. Data Sharing & Third Parties</h2>
+        <p>We do NOT sell, rent, or lease any data to data brokers, ad networks, or third parties. Data is only communicated with Stripe for payment processing and our secure Cloudflare Workers edge API for real-time analysis.</p>
+      </section>
+
+      <section>
+        <h2 class="text-base font-semibold text-cyan-400 mb-2">5. Contact Us</h2>
+        <p>If you have any questions or feedback regarding this Privacy Policy, please contact our support team at <a href="mailto:support@dropguard.io" class="text-cyan-400 underline hover:text-cyan-300">support@dropguard.io</a>.</p>
+      </section>
+    </div>
+
+    <div class="mt-8 pt-6 border-t border-slate-800 text-xs text-slate-500 text-center">
+      DropGuard &copy; 2026. All rights reserved.
+    </div>
+  </div>
+</body>
+</html>`;
+  return c.html(html);
+});
+
 // 2. Interactive Pricing & Stripe Checkout Landing Page
 app.get('/pricing', async (c) => {
   const rawDeviceId = c.req.query('deviceId') || '';
@@ -1169,6 +1233,13 @@ app.post('/api/v1/stripe-webhook', async (c) => {
       const dev = await activateFromPaidSession(obj, (c.env as any)?.DROP_GUARD_KV);
       if (dev) {
         console.log(`[DropGuard Stripe Webhook] 🎉 Payment verified! Activated PRO for device: ${dev}`);
+      } else if (
+        obj?.payment_status === 'paid' &&
+        sanitizeAndValidateDeviceId(obj?.client_reference_id || obj?.metadata?.device_id || '')
+      ) {
+        // Paid but entitlement could not be persisted: return 500 so Stripe retries the delivery instead of losing the order
+        console.error(`[DropGuard Stripe Webhook] ❌ Paid session ${obj?.id} could not be activated; requesting retry.`);
+        return c.json({ error: 'ACTIVATION_FAILED' }, 500);
       }
     } else if (event.type === 'charge.refunded' || event.type === 'charge.dispute.created') {
       // charge.refunded fires on partial refunds too; only revoke when fully refunded. Disputes always revoke.

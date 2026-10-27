@@ -122,6 +122,8 @@ async function safeFetch(url: string, options?: RequestInit): Promise<SafeFetchR
   ) {
     let resp: any = null;
 
+    // One automatic retry when the background proxy reports a network failure/timeout (transient DNS or routing hiccups)
+    for (let attempt = 0; attempt < 2; attempt++) {
     try {
       resp = await new Promise<any>((resolve) => {
         const timeout = setTimeout(() => resolve(null), 16000);
@@ -148,6 +150,12 @@ async function safeFetch(url: string, options?: RequestInit): Promise<SafeFetchR
     } catch {
       // Messaging channel threw, proceed to native fetch fallback
       resp = null;
+    }
+    if (resp && resp.status === 0 && attempt === 0) {
+      await new Promise((r) => setTimeout(r, 800));
+      continue;
+    }
+    break;
     }
 
     if (resp && typeof resp.status === 'number') {

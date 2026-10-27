@@ -52,6 +52,10 @@ export interface ProRecord {
   sessions?: string[]; // processed Stripe checkout session ids (idempotency)
 }
 
+// KV-backed entitlements are cached per isolate only briefly so refunds/revocations propagate across isolates.
+const PRO_CACHE_TTL_MS = 30_000;
+const proCacheAt = new Map<string, number>();
+
 const MONTHLY_VALIDITY_MS = 31 * 24 * 3600 * 1000;
 const ANNUAL_VALIDITY_MS = 366 * 24 * 3600 * 1000;
 
@@ -227,10 +231,10 @@ export async function activateProDeviceAsync(
   const now = Date.now();
   let existing = proDevices.get(safeId);
 
-  // If KV is bound and not in memory, try to load from KV first
-  if (!existing && kv && typeof kv.get === 'function') {
+  // With KV bound, always start from the shared record so renewals extend the real expiry (not a stale isolate copy)
+  if (kv && typeof kv.get === 'function') {
     try {
-      existing = await kv.get(`pro:${safeId}`, 'json');
+      existing = (await kv.get(`pro:${safeId}`, 'json')) ?? existing;
     } catch {
       // ignore
     }
@@ -258,6 +262,8 @@ export async function activateProDeviceAsync(
   if (options.sessionId) next.sessions = [...(existing?.sessions || []), options.sessionId].slice(-20);
 
   proDevices.set(safeId, next);
+  proCacheAt.set(safeId, Date.now());
+  let kvOk = true;
 
   // Write to KV if present
   if (kv && typeof kv.put === 'function') {
@@ -267,6 +273,7 @@ export async function activateProDeviceAsync(
         await kv.put(`pi:${next.paymentIntent}`, safeId);
       }
     } catch (err) {
+      kvOk = false;
       console.error(`[DropGuard Quota] ❌ Failed to write Pro device to KV: ${(err as Error)?.message}`);
     }
   }
@@ -278,7 +285,8 @@ export async function activateProDeviceAsync(
     // ignore in serverless environment
   }
 
-  return true;
+  // If KV was expected but the write failed, report failure so callers (Stripe webhook) can ask for a retry.
+  return kvOk;
 }
 
 export function activateProDevice(deviceId: string, options: ActivateOptions = {}): boolean {
@@ -324,32 +332,33 @@ export async function isProDeviceAsync(deviceId: string, kv?: any): Promise<bool
   const safeId = sanitizeAndValidateDeviceId(deviceId);
   if (!safeId) return false;
 
-  // 1. Check in-memory fast cache first
   const cached = proDevices.get(safeId);
-  if (cached) {
-    if (typeof cached.expiresAt === 'number' && cached.expiresAt <= Date.now()) {
-      return false;
-    }
-    return true;
+  const cachedAt = proCacheAt.get(safeId) ?? 0;
+  const usable = (rec: ProRecord) => !(typeof rec.expiresAt === 'number' && rec.expiresAt <= Date.now());
+
+  // Without KV (local dev / tests) the in-memory map is the source of truth.
+  if (!kv || typeof kv.get !== 'function') {
+    return Boolean(cached && usable(cached));
   }
 
-  // 2. Check KV if bound
-  if (kv && typeof kv.get === 'function') {
-    try {
-      const rec = await kv.get(`pro:${safeId}`, 'json');
-      if (rec && typeof rec === 'object') {
-        if (typeof rec.expiresAt === 'number' && rec.expiresAt <= Date.now()) {
-          return false;
-        }
-        proDevices.set(safeId, rec);
-        return true;
-      }
-    } catch {
-      // ignore
-    }
+  // With KV: trust a fresh cache entry, otherwise re-check KV (picks up other isolates' activations and revocations).
+  if (cached && Date.now() - cachedAt < PRO_CACHE_TTL_MS) {
+    return usable(cached);
   }
-
-  return false;
+  try {
+    const rec = await kv.get(`pro:${safeId}`, 'json');
+    if (rec && typeof rec === 'object') {
+      proDevices.set(safeId, rec);
+      proCacheAt.set(safeId, Date.now());
+      return usable(rec);
+    }
+    proDevices.delete(safeId);
+    proCacheAt.delete(safeId);
+    return false;
+  } catch {
+    // KV outage: fall back to the last known entitlement rather than locking out a paying user.
+    return Boolean(cached && usable(cached));
+  }
 }
 
 export function isProDevice(deviceId: string): boolean {
@@ -367,6 +376,7 @@ export async function revokeProDeviceAsync(deviceId: string, kv?: any): Promise<
   if (!safeId) return false;
   const had = proDevices.has(safeId);
   proDevices.delete(safeId);
+  proCacheAt.delete(safeId);
   if (kv && typeof kv.delete === 'function') {
     try {
       await kv.delete(`pro:${safeId}`);
@@ -597,15 +607,14 @@ export async function quotaMiddleware(c: Context, next: Next) {
   const today = getTodayDateString();
   let currentRecord = deviceQuotas.get(deviceId);
 
-  if ((!currentRecord || currentRecord.date !== today) && kv && typeof kv.get === 'function') {
+  // With KV the shared counter is authoritative so quota holds across isolates/regions.
+  if (kv && typeof kv.get === 'function') {
     try {
       const kvVal = await kv.get(`quota:${today}:${deviceId}`);
-      if (kvVal !== null) {
-        currentRecord = { date: today, count: parseInt(kvVal, 10) || 0 };
-        deviceQuotas.set(deviceId, currentRecord);
-      }
+      currentRecord = { date: today, count: kvVal === null ? 0 : parseInt(kvVal, 10) || 0 };
+      deviceQuotas.set(deviceId, currentRecord);
     } catch {
-      // ignore
+      // KV read failed: fall back to this isolate's in-memory counter
     }
   }
 
@@ -732,13 +741,11 @@ export async function getDeviceQuotaStatusAsync(deviceId: string, kv?: any) {
 
   const today = getTodayDateString();
   let record = deviceQuotas.get(safeId);
-  if ((!record || record.date !== today) && kv && typeof kv.get === 'function') {
+  if (kv && typeof kv.get === 'function') {
     try {
       const kvVal = await kv.get(`quota:${today}:${safeId}`);
-      if (kvVal !== null) {
-        record = { date: today, count: parseInt(kvVal, 10) || 0 };
-        deviceQuotas.set(safeId, record);
-      }
+      record = { date: today, count: kvVal === null ? 0 : parseInt(kvVal, 10) || 0 };
+      deviceQuotas.set(safeId, record);
     } catch {
       // ignore
     }

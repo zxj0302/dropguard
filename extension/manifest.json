@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DropGuard: Shopify & IP Infringement Radar",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "High-conversion Shopify store insights, IP trademark radar, and dropshipping competitor intelligence.",
   "permissions": [
     "storage",

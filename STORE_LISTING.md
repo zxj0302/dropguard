@@ -81,6 +81,9 @@ DropGuard executes its user interface inside an isolated Shadow DOM container to
 
 在 CWS 开发者中心 “Privacy practices” 标签页中按如下标准进行声明：
 
+- **隐私政策链接 (Privacy Policy URL)**:
+  `https://dropguard-api.dropguard.workers.dev/privacy`
+
 1. **是否收集个人身份信息 (Personally Identifiable Information)?**
    - **否 (No)**：不收集姓名、物理地址、电子邮箱、手机号或身份证件。
 2. **是否收集健康信息、金融信息或凭据?**

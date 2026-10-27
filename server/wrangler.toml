@@ -5,6 +5,7 @@ compatibility_flags = ["nodejs_compat"]
 
 [vars]
 NODE_ENV = "production"
+APP_BASE_URL = "https://dropguard-api.dropguard.workers.dev"
 
 # KV namespace for Pro devices and rate limiting
 # You can generate production & preview IDs using:
