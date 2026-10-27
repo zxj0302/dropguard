@@ -22,6 +22,7 @@ server/.used_tokens.json*
 dist/
 server/dist/
 extension/dist/
+*.zip
 
 # OS and Editor files
 .DS_Store
