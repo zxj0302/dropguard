@@ -43,17 +43,7 @@ export function sanitizeAndValidateDeviceId(raw: unknown): string | null {
 // Can be backed by Cloudflare KV or Redis in production
 const deviceQuotas = new Map<string, QuotaRecord>();
 
-// Pro subscriber entitlements with disk persistence.
-// Storage path: PRO_DEVICES_FILE env override, otherwise <server dir>/.pro_devices.json
-// (resolved from this module's location, NOT process.cwd()).
-const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
-const DEFAULT_PRO_FILE = path.resolve(MODULE_DIR, '..', '..', '.pro_devices.json');
-const LEGACY_CWD_FILES = [
-  path.resolve(process.cwd(), 'server/.pro_devices.json'),
-  path.resolve(process.cwd(), '.pro_devices.json'),
-];
-
-/** Pro entitlement record. `expiresAt` null/undefined means the entitlement never expires. */
+// Pro subscriber entitlements with disk persistence (Node.js dev/testing only).
 export interface ProRecord {
   expiresAt?: number | null; // epoch ms
   plan?: string;
@@ -65,13 +55,32 @@ export interface ProRecord {
 const MONTHLY_VALIDITY_MS = 31 * 24 * 3600 * 1000;
 const ANNUAL_VALIDITY_MS = 366 * 24 * 3600 * 1000;
 
-function getProStoragePath(): string {
-  if (process.env.PRO_DEVICES_FILE) return path.resolve(process.env.PRO_DEVICES_FILE);
-  if (fs.existsSync(DEFAULT_PRO_FILE)) return DEFAULT_PRO_FILE;
-  for (const legacy of LEGACY_CWD_FILES) {
-    if (fs.existsSync(legacy)) return legacy;
+function getProStoragePath(): string | null {
+  try {
+    if (typeof process !== 'undefined' && process.env?.PRO_DEVICES_FILE) {
+      return path.resolve(process.env.PRO_DEVICES_FILE);
+    }
+    if (typeof import.meta !== 'undefined' && typeof import.meta.url === 'string' && import.meta.url.startsWith('file:')) {
+      const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+      const defaultProFile = path.resolve(moduleDir, '..', '..', '.pro_devices.json');
+      if (typeof fs !== 'undefined' && typeof fs.existsSync === 'function' && fs.existsSync(defaultProFile)) {
+        return defaultProFile;
+      }
+      if (typeof process !== 'undefined' && typeof process.cwd === 'function') {
+        const legacyFiles = [
+          path.resolve(process.cwd(), 'server/.pro_devices.json'),
+          path.resolve(process.cwd(), '.pro_devices.json'),
+        ];
+        for (const legacy of legacyFiles) {
+          if (fs.existsSync(legacy)) return legacy;
+        }
+      }
+      return defaultProFile;
+    }
+  } catch {
+    // ignore
   }
-  return DEFAULT_PRO_FILE;
+  return null;
 }
 
 function parseProData(data: unknown): Map<string, ProRecord> {
@@ -121,7 +130,7 @@ function parseProData(data: unknown): Map<string, ProRecord> {
 
 function loadPersistedProDevices(): Map<string, ProRecord> {
   const target = getProStoragePath();
-  if (!fs.existsSync(target)) return new Map();
+  if (!target || typeof fs === 'undefined' || !fs.existsSync || !fs.existsSync(target)) return new Map();
   try {
     return parseProData(JSON.parse(fs.readFileSync(target, 'utf-8')));
   } catch (err) {
@@ -151,7 +160,8 @@ function loadPersistedProDevices(): Map<string, ProRecord> {
 /** Atomically persists Pro entitlements (temp file + rename). Returns false (and logs) on failure. */
 function savePersistedProDevices(devices: Map<string, ProRecord>): boolean {
   const target = getProStoragePath();
-  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+  if (!target || typeof fs === 'undefined' || !fs.writeFileSync) return false;
+  const tmp = `${target}.${typeof process !== 'undefined' ? process.pid : 'cf'}.${Date.now()}.tmp`;
   try {
     const payload = { version: 2, devices: Object.fromEntries(devices) };
     fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf-8');

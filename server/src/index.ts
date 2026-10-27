@@ -41,28 +41,31 @@ export type CloudflareBindings = {
 
 const app = new Hono<{ Bindings: CloudflareBindings }>();
 
-// Load .env file automatically if present
+// Load .env file automatically if present (Node.js dev only)
 try {
-  const envCandidates = ['./server/.env', '.env', path.resolve(process.cwd(), 'server/.env'), path.resolve(process.cwd(), '.env')];
-  for (const candidate of envCandidates) {
-    if (fs.existsSync(candidate)) {
-      if (typeof process.loadEnvFile === 'function') {
-        process.loadEnvFile(candidate);
-      } else {
-        const content = fs.readFileSync(candidate, 'utf-8');
-        for (const line of content.split('\n')) {
-          const match = line.match(/^\s*([\w.-]+)\s*=\s*(.*)?\s*$/);
-          if (match) {
-            const key = match[1];
-            let value = (match[2] || '').trim();
-            if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-              value = value.slice(1, -1);
+  if (typeof process !== 'undefined' && typeof process.cwd === 'function') {
+    const cwd = process.cwd();
+    const envCandidates = ['./server/.env', '.env', path.resolve(cwd, 'server/.env'), path.resolve(cwd, '.env')];
+    for (const candidate of envCandidates) {
+      if (typeof fs !== 'undefined' && typeof fs.existsSync === 'function' && fs.existsSync(candidate)) {
+        if (typeof process.loadEnvFile === 'function') {
+          process.loadEnvFile(candidate);
+        } else {
+          const content = fs.readFileSync(candidate, 'utf-8');
+          for (const line of content.split('\n')) {
+            const match = line.match(/^\s*([\w.-]+)\s*=\s*(.*)?\s*$/);
+            if (match) {
+              const key = match[1];
+              let value = (match[2] || '').trim();
+              if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+                value = value.slice(1, -1);
+              }
+              if (!process.env[key]) process.env[key] = value;
             }
-            if (!process.env[key]) process.env[key] = value;
           }
         }
+        break;
       }
-      break;
     }
   }
 } catch {
@@ -74,26 +77,36 @@ try {
 // (tokens then do not survive restarts, which is acceptable: they are a dev-only simulation aid).
 // It is intentionally never derived from ADMIN_KEY and has no hard-coded default.
 const CHECKOUT_SECRET: string =
-  process.env.CHECKOUT_SECRET && process.env.CHECKOUT_SECRET.length >= 16
+  (typeof process !== 'undefined' && process.env?.CHECKOUT_SECRET && process.env.CHECKOUT_SECRET.length >= 16)
     ? process.env.CHECKOUT_SECRET
     : crypto.randomBytes(32).toString('hex');
-if (!process.env.CHECKOUT_SECRET || process.env.CHECKOUT_SECRET.length < 16) {
+if (typeof process !== 'undefined' && (!process.env?.CHECKOUT_SECRET || process.env.CHECKOUT_SECRET.length < 16)) {
   console.warn('[DropGuard Server] CHECKOUT_SECRET not set (or shorter than 16 chars); generated a random one for this process.');
 }
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+const STRIPE_SECRET_KEY = (typeof process !== 'undefined' && process.env?.STRIPE_SECRET_KEY) || '';
+const STRIPE_WEBHOOK_SECRET = (typeof process !== 'undefined' && process.env?.STRIPE_WEBHOOK_SECRET) || '';
 const STRIPE_TIMEOUT_MS = 10_000;
 const WEBHOOK_TOLERANCE_SECONDS = 300;
 const CHECKOUT_TOKEN_TTL_MS = 24 * 3600 * 1000;
 const MAX_USED_TOKENS = 100_000;
 
-const USED_TOKENS_FILE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '.used_tokens.json');
+function getUsedTokensFilePath(): string | null {
+  try {
+    if (typeof import.meta !== 'undefined' && typeof import.meta.url === 'string' && import.meta.url.startsWith('file:')) {
+      return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '.used_tokens.json');
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
 
 function loadPersistedUsedTokens(): Map<string, number> {
   const map = new Map<string, number>();
   try {
-    if (fs.existsSync(USED_TOKENS_FILE)) {
-      const data = JSON.parse(fs.readFileSync(USED_TOKENS_FILE, 'utf-8'));
+    const file = getUsedTokensFilePath();
+    if (file && typeof fs !== 'undefined' && typeof fs.existsSync === 'function' && fs.existsSync(file)) {
+      const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
       const now = Date.now();
       if (data && typeof data === 'object') {
         for (const [t, exp] of Object.entries(data)) {
@@ -111,14 +124,16 @@ function loadPersistedUsedTokens(): Map<string, number> {
 
 function persistUsedTokens(tokens: Map<string, number>) {
   try {
+    const file = getUsedTokensFilePath();
+    if (!file || typeof fs === 'undefined' || typeof fs.writeFileSync !== 'function') return;
     const now = Date.now();
     const obj: Record<string, number> = {};
     for (const [t, exp] of tokens) {
       if (exp > now) obj[t] = exp;
     }
-    const tmp = `${USED_TOKENS_FILE}.${process.pid}.tmp`;
+    const tmp = `${file}.${typeof process !== 'undefined' ? process.pid : 'cf'}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(obj), 'utf-8');
-    fs.renameSync(tmp, USED_TOKENS_FILE);
+    fs.renameSync(tmp, file);
   } catch {
     // ignore
   }
@@ -1396,14 +1411,17 @@ export function startServer(customPort?: number) {
  * Checks whether this module is directly executed as the main application entrypoint.
  */
 export function isMainModule(): boolean {
-  if (process.env.NODE_ENV === 'test' || process.env.DISABLE_SERVER_AUTOSTART === 'true') {
+  if (typeof process === 'undefined' || !process.argv || !process.argv[1]) {
     return false;
   }
-  if (!process.argv || !process.argv[1]) {
+  if (process.env?.NODE_ENV === 'test' || process.env?.DISABLE_SERVER_AUTOSTART === 'true') {
     return false;
   }
 
   try {
+    if (typeof import.meta === 'undefined' || typeof import.meta.url !== 'string' || !import.meta.url.startsWith('file:')) {
+      return false;
+    }
     const currentFilePath = fileURLToPath(import.meta.url);
     const executedFilePath = path.resolve(process.argv[1]);
 
@@ -1412,7 +1430,7 @@ export function isMainModule(): boolean {
     }
 
     try {
-      if (fs.realpathSync(currentFilePath) === fs.realpathSync(executedFilePath)) {
+      if (typeof fs !== 'undefined' && typeof fs.realpathSync === 'function' && fs.realpathSync(currentFilePath) === fs.realpathSync(executedFilePath)) {
         return true;
       }
     } catch {
