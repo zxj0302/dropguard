@@ -17,8 +17,8 @@
     "test": "tsx test_verification.ts"
   },
   "devDependencies": {
+    "puppeteer-core": "^25.16.0",
     "tsx": "^4.19.2",
     "typescript": "^5.6.3"
   }
 }
-
