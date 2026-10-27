@@ -76,12 +76,17 @@ try {
 // CHECKOUT_SECRET must be an explicit strong value; otherwise a random per-process secret is generated
 // (tokens then do not survive restarts, which is acceptable: they are a dev-only simulation aid).
 // It is intentionally never derived from ADMIN_KEY and has no hard-coded default.
-const CHECKOUT_SECRET: string =
-  (typeof process !== 'undefined' && process.env?.CHECKOUT_SECRET && process.env.CHECKOUT_SECRET.length >= 16)
-    ? process.env.CHECKOUT_SECRET
-    : crypto.randomBytes(32).toString('hex');
-if (typeof process !== 'undefined' && (!process.env?.CHECKOUT_SECRET || process.env.CHECKOUT_SECRET.length < 16)) {
-  console.warn('[DropGuard Server] CHECKOUT_SECRET not set (or shorter than 16 chars); generated a random one for this process.');
+// Resolved lazily: Cloudflare Workers forbid random generation in global scope.
+let cachedCheckoutSecret: string | null = null;
+function getCheckoutSecret(): string {
+  if (cachedCheckoutSecret) return cachedCheckoutSecret;
+  if (typeof process !== 'undefined' && process.env?.CHECKOUT_SECRET && process.env.CHECKOUT_SECRET.length >= 16) {
+    cachedCheckoutSecret = process.env.CHECKOUT_SECRET;
+  } else {
+    cachedCheckoutSecret = crypto.randomBytes(32).toString('hex');
+    console.warn('[DropGuard Server] CHECKOUT_SECRET not set (or shorter than 16 chars); generated a random one for this process.');
+  }
+  return cachedCheckoutSecret;
 }
 const STRIPE_SECRET_KEY = (typeof process !== 'undefined' && process.env?.STRIPE_SECRET_KEY) || '';
 const STRIPE_WEBHOOK_SECRET = (typeof process !== 'undefined' && process.env?.STRIPE_WEBHOOK_SECRET) || '';
@@ -155,7 +160,7 @@ export function isDevMode(c?: Context): boolean {
  * Generates a tamper-proof HMAC-signed checkout token for simulated payments (development mode only).
  */
 export function generateCheckoutToken(deviceId: string, secretOverride?: string): string {
-  const secret = secretOverride || CHECKOUT_SECRET;
+  const secret = secretOverride || getCheckoutSecret();
   const timestamp = Date.now();
   const nonce = crypto.randomBytes(16).toString('hex');
   const payload = `${deviceId}:${timestamp}:${nonce}`;
@@ -188,7 +193,7 @@ export async function verifyAndConsumeCheckoutTokenAsync(deviceId: string, token
       return false;
     }
 
-    const secret = secretOverride || CHECKOUT_SECRET;
+    const secret = secretOverride || getCheckoutSecret();
     const payload = `${tokenDeviceId}:${timestampStr}:${nonce}`;
     const expectedHmac = crypto.createHmac('sha256', secret).update(payload).digest('hex');
     const given = Buffer.from(hmac, 'hex');
@@ -241,7 +246,7 @@ export function verifyAndConsumeCheckoutToken(deviceId: string, token: string): 
     }
 
     const payload = `${tokenDeviceId}:${timestampStr}:${nonce}`;
-    const expectedHmac = crypto.createHmac('sha256', CHECKOUT_SECRET).update(payload).digest('hex');
+    const expectedHmac = crypto.createHmac('sha256', getCheckoutSecret()).update(payload).digest('hex');
     const given = Buffer.from(hmac, 'hex');
     const expected = Buffer.from(expectedHmac, 'hex');
     if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return false;
