@@ -19,9 +19,9 @@ DropGuard 服务端已完成对 **Cloudflare Workers + Cloudflare KV** 的原生
 
 ### 第一步：创建 Cloudflare KV 命名空间（持久化存储）
 
-在 `server/` 目录下运行：
+在 `server/` 目录下运行（注意是空格 `kv namespace create`）：
 ```bash
-npx wrangler kv:namespace create DROP_GUARD_KV
+npx wrangler kv namespace create DROP_GUARD_KV
 ```
 命令输出示例：
 ```
@@ -42,7 +42,7 @@ id = "你的KV_ID填在这里"
 
 *(可选：创建用于本地预览测试的 preview KV)*
 ```bash
-npx wrangler kv:namespace create DROP_GUARD_KV --preview
+npx wrangler kv namespace create DROP_GUARD_KV --preview
 ```
 
 ---
