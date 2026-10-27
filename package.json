@@ -1,0 +1,23 @@
+{
+  "name": "dropguard-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DropGuard: Shopify & IP Infringement Radar Monorepo",
+  "workspaces": [
+    "extension",
+    "server"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace=extension && npm run build --workspace=server",
+    "build:extension": "npm run build --workspace=extension",
+    "build:server": "npm run build --workspace=server",
+    "dev:server": "npm run dev --workspace=server",
+    "dev:extension": "npm run dev --workspace=extension",
+    "test": "tsx test_verification.ts"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}
+
