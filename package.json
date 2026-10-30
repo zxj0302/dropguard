@@ -15,7 +15,10 @@
     "preview:server": "npm run preview --workspace=server",
     "dev:server": "npm run dev --workspace=server",
     "dev:extension": "npm run dev --workspace=extension",
-    "package": "VITE_API_BASE_URL=https://dropguard-api.dropguard.workers.dev npm run build:extension && (cd extension/dist && zip -q -r -FS ../../dropguard-extension-v1.0.1.zip .)",
+    "package": "VITE_API_BASE_URL=https://dropguard-api.dropguard.workers.dev npm run build:extension && cp -r extension/_locales extension/dist/ && (cd extension/dist && zip -q -r -FS ../../dropguard-extension-v1.0.5.zip .)",
+    "cws:status": "node scripts/cws_deploy.js status",
+    "cws:upload": "node scripts/cws_deploy.js upload",
+    "cws:publish": "node scripts/cws_deploy.js publish",
     "test": "tsx test_verification.ts"
   },
   "devDependencies": {

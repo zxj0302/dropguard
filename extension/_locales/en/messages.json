@@ -1,0 +1,11 @@
+{
+  "appName": {
+    "message": "DropGuard: Shopify Spy & Trademark IP Radar",
+    "description": "The extension name."
+  },
+  "appDesc": {
+    "message": "Shopify spy & trademark IP checker: inspect store themes, detect TRO lawsuit risks, and uncover 1688 factory margins in 1 click.",
+    "description": "The extension description."
+  }
+}
+
